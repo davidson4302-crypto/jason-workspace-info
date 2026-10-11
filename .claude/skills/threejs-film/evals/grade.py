@@ -89,7 +89,5 @@ if __name__ == '__main__':
             rd = os.path.join(ed, cfg, 'run-1')
             if not os.path.isdir(os.path.join(rd, 'outputs')): continue
             g = grade(rd, name)
-            tf = os.path.join(rd, 'timing.json')
-            if os.path.exists(tf): g['timing'] = json.load(open(tf))
             json.dump(g, open(os.path.join(rd, 'grading.json'), 'w'), indent=1)
             print(f"{name:34s} {cfg:14s} {g['summary']['passed']}/{g['summary']['total']}")
