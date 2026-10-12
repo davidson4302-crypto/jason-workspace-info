@@ -1,0 +1,699 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@400;500;600&display=block" rel="stylesheet">
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<style>
+  :root { color-scheme: light; }
+  html, body { margin: 0; height: 100%; background: #111; }
+  body { display: grid; place-items: center; overflow: hidden; }
+  #film { display: block; max-width: 100vw; max-height: 100vh; cursor: pointer; }
+  body.render { display: block; }
+  body.render #film { max-width: none; max-height: none; cursor: default; }
+</style>
+</head>
+<body>
+<canvas id="film"></canvas>
+<script type="module">
+import * as THREE from 'three';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+
+// =====================================================================================
+// Frame-exact three.js film. window.renderAt(t) paints any frame from t alone; all randomness is
+// seeded; secondary motion that needs history is simulated once at load into tables.
+// window.renderAudio() synthesizes the score offline (Web Audio) and returns a mastered WAV.
+//
+// Sections marked SCENE are the film. Everything else is the engine: keep it unless the brief needs
+// a change, and keep the window.* contract (FILM, renderAt, frameCheck, renderAudio, filmReady).
+// =====================================================================================
+
+// ------------------------------------------------------------------ FILM (scene) ----
+const FILM = { title: '__TITLE__', W: __W__, H: __H__, FPS: __FPS__, SECONDS: __SECONDS__, LOOP: __LOOP__ };
+const { W, H, FPS } = FILM, N = Math.round(FILM.SECONDS * FPS), DUR = N / FPS;
+window.FILM = { ...FILM, frames: N, duration: DUR };
+const RENDER = new URLSearchParams(location.search).has('render');
+if (RENDER) document.body.classList.add('render');
+
+// ------------------------------------------------------------------ math ------------
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const sstep = (a, b, x) => { const t = clamp((x - a) / (b - a)); return t * t * (3 - 2 * t); };
+const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
+const easeInQuad = (t) => t * t;
+const easeInOutCubic = (t) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2);
+const easeInOutSine = (t) => -(Math.cos(Math.PI * t) - 1) / 2;
+const rad = THREE.MathUtils.degToRad;
+// Loops wrap time; one-shots clamp it.
+const wrap = (f) => (FILM.LOOP ? ((f % N) + N) % N : clamp(f, 0, N - 1));
+function mulberry32(a) {
+  return () => {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+// Damped spring released from a displacement (step response, zero start velocity): 1 -> 0.
+function springStep(tau, zeta, hz) {
+  if (tau <= 0) return 1;
+  const w = 2 * Math.PI * hz, s = Math.sqrt(1 - zeta * zeta), wd = w * s;
+  return Math.exp(-zeta * w * tau) * (Math.cos(wd * tau) + (zeta / s) * Math.sin(wd * tau));
+}
+// Keyed values: keys = [[frame, value], ...] with an ease per segment.
+function keys(k, f, ease = easeInOutSine) {
+  if (f <= k[0][0]) return k[0][1];
+  for (let i = 1; i < k.length; i++) if (f <= k[i][0]) return lerp(k[i - 1][1], k[i][1], ease((f - k[i - 1][0]) / Math.max(1e-6, k[i][0] - k[i - 1][0])));
+  return k[k.length - 1][1];
+}
+
+// Secondary motion with history (limbs driven by the body's acceleration, follow cameras) is simulated
+// once here over three passes, so the stored table is the loop's steady state; renderAt only reads it.
+const SUB = 8, NS = N * SUB;
+function accelSpring(signal, { hz, zeta, gain, lag = 0 }) {
+  const dt = 1 / (FPS * SUB), s = new Float64Array(NS), out = new Float32Array(NS);
+  for (let n = 0; n < NS; n++) s[n] = signal(n / SUB);
+  const at = (n) => s[FILM.LOOP ? ((n % NS) + NS) % NS : clamp(n, 0, NS - 1)];
+  const acc = (n) => (at(n + 1) - 2 * at(n) + at(n - 1)) / (dt * dt);
+  const w = 2 * Math.PI * hz; let x = 0, v = 0;
+  for (let pass = 0; pass < (FILM.LOOP ? 3 : 1); pass++) {
+    for (let n = 0; n < NS; n++) {
+      v += (-w * w * x - 2 * zeta * w * v - gain * acc(n - lag * SUB)) * dt; x += v * dt;
+      if (pass === (FILM.LOOP ? 2 : 0)) out[n] = x;
+    }
+  }
+  return out;
+}
+function followTable(target, hz) {
+  const dt = 1 / (FPS * SUB), out = new Float32Array(NS), w = 2 * Math.PI * hz;
+  let x = target(0), v = 0;
+  for (let pass = 0; pass < (FILM.LOOP ? 3 : 1); pass++) {
+    for (let n = 0; n < NS; n++) {
+      v += (w * w * (target(n / SUB) - x) - 2 * w * v) * dt; x += v * dt;
+      if (pass === (FILM.LOOP ? 2 : 0)) out[n] = x;
+    }
+  }
+  return out;
+}
+function tab(arr, f) {
+  const p = wrap(f) * SUB, i = Math.floor(p), u = p - i;
+  return lerp(arr[i % NS], arr[Math.min(i + 1, FILM.LOOP ? i + 1 : NS - 1) % NS], u);
+}
+// Colour temperature -> linear RGB at unit luminance, tempered toward neutral by (1 - strength).
+function kelvin(K, strength = 1) {
+  const t = K / 100; let r, g, b;
+  if (t <= 66) { r = 255; g = 99.4708025861 * Math.log(t) - 161.1195681661; b = t <= 19 ? 0 : 138.5177312231 * Math.log(t - 10) - 305.0447927307; }
+  else { r = 329.698727446 * Math.pow(t - 60, -0.1332047592); g = 288.1221695283 * Math.pow(t - 60, -0.0755148492); b = 255; }
+  const c = new THREE.Color().setRGB(clamp(r / 255), clamp(g / 255), clamp(b / 255), THREE.SRGBColorSpace);
+  c.lerp(new THREE.Color(1, 1, 1), 1 - strength);
+  return c.multiplyScalar(1 / (0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b));
+}
+// A light that clicks on with a short flicker and snaps off.
+const FLICKER = [1.0, 0.08, 0.6];
+function lightLevel(on, f, off = Infinity) {
+  if (f < on || f >= off) return 0;
+  const i = Math.floor(f - on + 1e-6);
+  return i < FLICKER.length ? FLICKER[i] : 1;
+}
+
+// ------------------------------------------------------------------ renderer -------
+const canvas = document.getElementById('film');
+canvas.width = W; canvas.height = H;
+if (RENDER) { canvas.style.width = W + 'px'; canvas.style.height = H + 'px'; }
+else { canvas.style.aspectRatio = `${W} / ${H}`; canvas.style.width = W >= H ? 'min(100vw, ' + (100 * W / H) + 'vh)' : 'auto'; canvas.style.height = W >= H ? 'auto' : 'min(100vh, ' + (100 * H / W) + 'vw)'; }
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, preserveDrawingBuffer: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(1); renderer.setSize(W, H, false);
+renderer.toneMapping = THREE.NoToneMapping;                    // the final pass grades
+renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFShadowMap; renderer.shadowMap.autoUpdate = false;
+const MAX_ANISO = renderer.capabilities.getMaxAnisotropy();
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(24, W / H, 2, 200);
+
+// ------------------------------------------------------------------ overlay text ----
+// 2D type is drawn here and composited after the grade, so it stays crisp and on-colour.
+const overlay = document.createElement('canvas'); overlay.width = W; overlay.height = H;
+const octx = overlay.getContext('2d');
+const overlayTex = new THREE.CanvasTexture(overlay);
+overlayTex.colorSpace = THREE.NoColorSpace; overlayTex.minFilter = THREE.LinearFilter; overlayTex.generateMipmaps = false;
+let overlayKey = null;
+function setOverlay(key, draw) { if (key === overlayKey) return; overlayKey = key; octx.clearRect(0, 0, W, H); draw(octx); overlayTex.needsUpdate = true; }
+
+// ------------------------------------------------------------------ post -----------
+// scene (HDR, 4x MSAA) -> depth pre-pass -> DOF -> bloom (max-channel threshold) -> white balance ->
+// hue-preserving shoulder -> sRGB -> vignette -> overlay -> grain + dither
+const rtScene = new THREE.WebGLRenderTarget(W, H, { type: THREE.HalfFloatType, samples: 4 });
+const rtDepth = new THREE.WebGLRenderTarget(W, H, { depthTexture: new THREE.DepthTexture(W, H, THREE.FloatType) });
+const rtDof = new THREE.WebGLRenderTarget(W, H, { type: THREE.HalfFloatType });
+const BLOOM_LEVELS = 6, rtDown = [], rtUp = [];
+for (let i = 0; i < BLOOM_LEVELS; i++) {
+  const w = Math.max(1, Math.round(W / 2 ** (i + 1))), h = Math.max(1, Math.round(H / 2 ** (i + 1)));
+  rtDown.push(new THREE.WebGLRenderTarget(w, h, { type: THREE.HalfFloatType }));
+  rtUp.push(new THREE.WebGLRenderTarget(w, h, { type: THREE.HalfFloatType }));
+}
+const depthOnly = new THREE.MeshBasicMaterial({ colorWrite: false });
+const quadScene = new THREE.Scene(), quadCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+const quadGeo = new THREE.BufferGeometry();
+quadGeo.setAttribute('position', new THREE.Float32BufferAttribute([-1, -1, 0, 3, -1, 0, -1, 3, 0], 3));
+quadGeo.setAttribute('uv', new THREE.Float32BufferAttribute([0, 0, 2, 0, 0, 2], 2));
+const quad = new THREE.Mesh(quadGeo); quad.frustumCulled = false; quadScene.add(quad);
+const VERT = 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }';
+const shader = (frag, uniforms) => new THREE.ShaderMaterial({ vertexShader: VERT, fragmentShader: frag, uniforms, depthTest: false, depthWrite: false });
+function pass(mat, target) { quad.material = mat; renderer.setRenderTarget(target); renderer.render(quadScene, quadCam); }
+
+const dofMat = shader(`
+  uniform sampler2D tColor, tDepth; uniform vec2 texel; uniform float near, far, focus, cocK, maxCoc;
+  varying vec2 vUv;
+  float linZ(vec2 uv){ float d = texture2D(tDepth, uv).x; return near * far / (far - d * (far - near)); }
+  float coc(float z){ return min(maxCoc, cocK * abs(1.0 / focus - 1.0 / z)); }
+  void main(){
+    vec3 c0 = texture2D(tColor, vUv).rgb; float z0 = linZ(vUv); float r0 = coc(z0);
+    vec3 acc = c0; float ws = 1.0;
+    for (int i = 0; i < 48; i++) {
+      float fi = float(i) + 0.5; float r = sqrt(fi / 48.0) * maxCoc; float a = fi * 2.39996323;
+      vec2 uv = vUv + vec2(cos(a), sin(a)) * r * texel;
+      float zs = linZ(uv); float rs = coc(zs);
+      if (zs > z0) rs = min(rs, r0);                     // background never spills over nearer pixels
+      float w = smoothstep(r - 1.0, r + 0.5, rs);
+      acc += texture2D(tColor, uv).rgb * w; ws += w;
+    }
+    gl_FragColor = vec4(acc / ws, 1.0);
+  }`, { tColor: { value: null }, tDepth: { value: null }, texel: { value: new THREE.Vector2(1 / W, 1 / H) },
+  near: { value: camera.near }, far: { value: camera.far }, focus: { value: 10 }, cocK: { value: 0 }, maxCoc: { value: 9 } });
+const prefilterMat = shader(`
+  uniform sampler2D tSrc; uniform vec2 texel; uniform float thr, knee; varying vec2 vUv;
+  void main(){
+    vec3 c = 0.25 * (texture2D(tSrc, vUv + texel * vec2(-0.5,-0.5)).rgb + texture2D(tSrc, vUv + texel * vec2(0.5,-0.5)).rgb
+               + texture2D(tSrc, vUv + texel * vec2(-0.5,0.5)).rgb + texture2D(tSrc, vUv + texel * vec2(0.5,0.5)).rgb);
+    float m = max(c.r, max(c.g, c.b));
+    float s = clamp(m - thr + knee, 0.0, 2.0 * knee); s = s * s / (4.0 * knee + 1e-4);
+    gl_FragColor = vec4(c * max(s, m - thr) / max(m, 1e-4), 1.0);
+  }`, { tSrc: { value: null }, texel: { value: new THREE.Vector2() }, thr: { value: 1.3 }, knee: { value: 0.3 } });
+const downMat = shader(`
+  uniform sampler2D tSrc; uniform vec2 texel; varying vec2 vUv;
+  void main(){
+    vec3 c = texture2D(tSrc, vUv).rgb * 4.0;
+    c += texture2D(tSrc, vUv + texel * vec2(-1.0,-1.0)).rgb + texture2D(tSrc, vUv + texel * vec2(1.0,-1.0)).rgb;
+    c += texture2D(tSrc, vUv + texel * vec2(-1.0,1.0)).rgb + texture2D(tSrc, vUv + texel * vec2(1.0,1.0)).rgb;
+    gl_FragColor = vec4(c / 8.0, 1.0);
+  }`, { tSrc: { value: null }, texel: { value: new THREE.Vector2() } });
+const upMat = shader(`
+  uniform sampler2D tSrc, tAdd; uniform vec2 texel; varying vec2 vUv;
+  void main(){
+    vec3 c = texture2D(tSrc, vUv + texel * vec2(-2.0, 0.0)).rgb + texture2D(tSrc, vUv + texel * vec2(2.0, 0.0)).rgb;
+    c += texture2D(tSrc, vUv + texel * vec2(0.0, -2.0)).rgb + texture2D(tSrc, vUv + texel * vec2(0.0, 2.0)).rgb;
+    c += 2.0 * (texture2D(tSrc, vUv + texel * vec2(-1.0,-1.0)).rgb + texture2D(tSrc, vUv + texel * vec2(1.0,-1.0)).rgb);
+    c += 2.0 * (texture2D(tSrc, vUv + texel * vec2(-1.0,1.0)).rgb + texture2D(tSrc, vUv + texel * vec2(1.0,1.0)).rgb);
+    gl_FragColor = vec4(c / 12.0 + texture2D(tAdd, vUv).rgb, 1.0);
+  }`, { tSrc: { value: null }, tAdd: { value: null }, texel: { value: new THREE.Vector2() } });
+const finalMat = shader(`
+  uniform sampler2D tColor, tBloom, tOverlay; uniform float bloom, frame, grain, vignette, shoulder; uniform vec3 wb; varying vec2 vUv;
+  float hash(vec3 p){ p = fract(p * vec3(0.1031, 0.1030, 0.0973)); p += dot(p, p.yxz + 33.33); return fract((p.x + p.y) * p.z); }
+  vec3 toSRGB(vec3 c){ c = max(c, 0.0); return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c)); }
+  void main(){
+    vec3 c = (texture2D(tColor, vUv).rgb + bloom * texture2D(tBloom, vUv).rgb) * wb;
+    float m = max(c.r, max(c.g, c.b));
+    if (m > shoulder) c *= (shoulder + (1.0 - shoulder) * (1.0 - exp(-(m - shoulder) / (1.0 - shoulder)))) / m;
+    c = toSRGB(c);
+    vec2 d = (vUv - 0.5) * 2.0;
+    c *= 1.0 - vignette * smoothstep(0.3, 1.4142, length(d));
+    vec4 L = texture2D(tOverlay, vUv); c = mix(c, L.rgb, L.a);
+    vec2 px = gl_FragCoord.xy;
+    float g1 = hash(vec3(px, frame * 7.13 + 1.0)), g2 = hash(vec3(px + 17.0, frame * 3.71 + 5.0));
+    float d1 = hash(vec3(px + 41.0, frame * 1.93 + 9.0)), d2 = hash(vec3(px + 83.0, frame * 5.37 + 2.0));
+    c += (g1 + g2 - 1.0) * grain + (d1 + d2 - 1.0) / 255.0;
+    gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);
+  }`, { tColor: { value: rtDof.texture }, tBloom: { value: null }, tOverlay: { value: overlayTex },
+  bloom: { value: 0.55 }, frame: { value: 0 }, grain: { value: 0.02 }, vignette: { value: 0.10 }, shoulder: { value: 0.84 },
+  wb: { value: new THREE.Vector3(1, 1, 1) } });
+
+// Graded backdrop: an unlit floor whose level follows the lights (so cone edges never streak across it),
+// with a soft falloff and the soft shadow of whatever floats above it.
+function makeBackdrop({ y = -1.5, shadowCenter = [0, 0.8], shadowHalf = [2, 2], shadowRound = 0.6, shadowDark = 0.45, shadowSoft = [-1.2, 2.6] } = {}) {
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { uColor: { value: new THREE.Color() } },
+    vertexShader: 'varying vec3 vW; void main(){ vec4 w = modelMatrix * vec4(position, 1.0); vW = w.xyz; gl_Position = projectionMatrix * viewMatrix * w; }',
+    fragmentShader: `
+      uniform vec3 uColor; varying vec3 vW;
+      float box(vec2 p, vec2 b, float r){ vec2 q = abs(p) - b + r; return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r; }
+      void main(){
+        float pool = 1.0 - 0.16 * smoothstep(3.0, 26.0, length(vW.xz - vec2(0.0, -2.0)));
+        float d = box(vW.xz - vec2(${shadowCenter[0].toFixed(3)}, ${shadowCenter[1].toFixed(3)}), vec2(${shadowHalf[0].toFixed(3)}, ${shadowHalf[1].toFixed(3)}), ${shadowRound.toFixed(3)});
+        float shade = 1.0 - ${shadowDark.toFixed(3)} * (1.0 - smoothstep(${shadowSoft[0].toFixed(3)}, ${shadowSoft[1].toFixed(3)}, d));
+        gl_FragColor = vec4(uColor * pool * shade, 1.0);
+      }`,
+  });
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(500, 500), mat);
+  m.rotation.x = -Math.PI / 2; m.position.y = y;
+  return m;
+}
+
+// ------------------------------------------------------------------ checks ---------
+// The render tool reads these: props must stay out of keepOut rects and inside the frame where the
+// beat sheet says so; probes are world points whose graded colour the tool samples.
+const CHECK = { props: {}, keepOut: [], probes: {}, notes: {} };
+const _v = new THREE.Vector3();
+function project(p) { _v.copy(p).project(camera); return [(_v.x * 0.5 + 0.5) * W, (1 - (_v.y * 0.5 + 0.5)) * H]; }
+function rectOf(obj) {
+  const box = new THREE.Box3().setFromObject(obj), r = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
+  if (box.isEmpty()) return null;
+  for (let i = 0; i < 8; i++) {
+    const [x, y] = project(_v.set(i & 1 ? box.max.x : box.min.x, i & 2 ? box.max.y : box.min.y, i & 4 ? box.max.z : box.min.z).clone());
+    r.x0 = Math.min(r.x0, x); r.x1 = Math.max(r.x1, x); r.y0 = Math.min(r.y0, y); r.y1 = Math.max(r.y1, y);
+  }
+  return r;
+}
+
+// =================================================================== SCENE ==========
+// Demo scene: a voxel cube on a floating plinth. The key light clicks on, the cube crouches, hops,
+// lands with squash and a spring, its antennae trail (overlapping action), sparks fly, a label checks
+// off, the light snaps off and the loop returns to frame 0. Replace all of it with the brief.
+
+const PAL = { hero: 0xD97757, accent: 0xFF6A2B, ink: 0x0F0F0F, backdrop: 0xF4F2EE, gray: 0x8E8A83, white: 0xFFFFFF };
+const CSS = { accent: '#FF6A2B', ink: '#0F0F0F', gray: '#8E8A83' };
+
+// Timeline, in frames. Every visual event lives here so picture and score share one source of truth.
+const T = { keyOn: 6, crouch: 60, takeoff: 72, land: 108, off: N - 12 };
+const HOP = { h: 1.0, crouch: [1.2, 0.75], stretch: [0.85, 1.28], land: [1.25, 0.7], spring: { zeta: 0.55, hz: 3.2 } };
+const GROUND = 0, HALF = 0.3;            // plinth top; half the cube's height
+
+// Look: grade levels. Lights-off sits near 50%; each light adds its own bounce so the click reads.
+const TEMP = { key: kelvin(3200, 0.3), rim: kelvin(7500, 0.8) };
+const LEVELS = { fill: 0.6, key: 3.3, rim: 2.0, bounceKey: 0.12, bounceRim: 0.05, backOff: 0.25, backKey: 0.33, backRim: 0.085 };
+
+const M = {
+  plinth: new THREE.MeshStandardMaterial({ color: PAL.white, roughness: 0.55 }),
+  hero: new THREE.MeshPhysicalMaterial({ color: PAL.hero, roughness: 0.45, clearcoat: 0.3, clearcoatRoughness: 0.3 }),
+  ink: new THREE.MeshPhysicalMaterial({ color: PAL.ink, roughness: 0.3, clearcoat: 0.8 }),
+  spark: new THREE.MeshBasicMaterial({ color: PAL.accent }),
+};
+
+const backdrop = makeBackdrop({ y: -1.4, shadowCenter: [0, 0.9], shadowHalf: [2.0, 2.0], shadowRound: 0.5 });
+scene.add(backdrop);
+const BACKDROP_LIN = new THREE.Color(PAL.backdrop);
+
+const plinth = new THREE.Mesh(new RoundedBoxGeometry(4, 0.4, 4, 3, 0.06), M.plinth);
+plinth.position.y = -0.2; plinth.receiveShadow = true; scene.add(plinth);
+
+// Voxel hero: surface voxels of a 6x6x6 block, two eyes, two antennae.
+const V = 0.1, voxGeo = new RoundedBoxGeometry(V, V, V, 1, 0.016);
+function voxels(cells, mat, seed) {
+  const m = new THREE.InstancedMesh(voxGeo, mat, cells.length), o = new THREE.Object3D(), r = mulberry32(seed), c = new THREE.Color();
+  cells.forEach(([x, y, z], i) => { o.position.set(x, y, z); o.updateMatrix(); m.setMatrixAt(i, o.matrix); const k = 0.985 + 0.03 * r(); m.setColorAt(i, c.setRGB(k, k, k)); });
+  m.castShadow = true; m.receiveShadow = true; return m;
+}
+function block(nx, ny, nz, cx, y0, cz, surface = true) {
+  const out = [];
+  for (let i = 0; i < nx; i++) for (let j = 0; j < ny; j++) for (let k = 0; k < nz; k++) {
+    if (surface && i > 0 && j > 0 && k > 0 && i < nx - 1 && j < ny - 1 && k < nz - 1) continue;
+    out.push([cx + (i - (nx - 1) / 2) * V, y0 + (j + 0.5) * V, cz + (k - (nz - 1) / 2) * V]);
+  }
+  return out;
+}
+const hero = { rig: new THREE.Group(), def: new THREE.Group() };
+hero.rig.add(hero.def); hero.def.position.y = -HALF;
+hero.def.add(voxels(block(6, 6, 6, 0, 0, 0), M.hero, 3));
+hero.eyes = [-0.12, 0.12].map((x, i) => { const g = new THREE.Group(); g.position.set(x, 0.38, 0.27); g.add(voxels(block(1, 2, 1, 0, -0.1, 0, false), M.ink, 7 + i)); hero.def.add(g); return g; });
+hero.antennae = [-0.15, 0.15].map((x, i) => { const g = new THREE.Group(); g.position.set(x, 0.6, 0); g.add(voxels(block(1, 3, 1, 0, 0, 0, false), M.hero, 9 + i)); hero.def.add(g); return g; });
+scene.add(hero.rig);
+
+// Body: anticipation, stretch, ballistic arc, squash, spring back. Pure function of the frame.
+function body(f) {
+  const kc = (HOP.crouch[0] - 1) / (HOP.crouch[1] - 1), ks = (HOP.stretch[0] - 1) / (HOP.stretch[1] - 1), kl = (HOP.land[0] - 1) / (HOP.land[1] - 1);
+  let lift = 0, sy = 1, k = kc;
+  if (f >= T.crouch && f < T.takeoff - 2) sy = 1 - (1 - HOP.crouch[1]) * sstep(T.crouch, T.takeoff - 2, f);
+  else if (f >= T.takeoff - 2 && f < T.takeoff) { sy = lerp(HOP.crouch[1], HOP.stretch[1], easeInQuad((f - T.takeoff + 2) / 2)); k = sy < 1 ? kc : ks; }
+  else if (f >= T.takeoff && f < T.land) {
+    const u = (f - T.takeoff) / (T.land - T.takeoff), air = T.land - T.takeoff;
+    lift = 4 * HOP.h * u * (1 - u);
+    if (f < T.takeoff + air * 0.45) sy = lerp(HOP.stretch[1], 1, easeOutCubic((f - T.takeoff) / (air * 0.45)));
+    else if (f >= T.land - 1) sy = lerp(1.06, HOP.land[1], f - (T.land - 1));
+    else if (f >= T.land - 6) sy = lerp(1, 1.06, (f - T.land + 6) / 5);
+    k = sy < 1 ? kl : ks;
+  } else if (f >= T.land) { sy = 1 + (HOP.land[1] - 1) * springStep((f - T.land) / FPS, HOP.spring.zeta, HOP.spring.hz); k = sy < 1 ? kl : ks; }
+  return { lift, sy, sx: 1 + (sy - 1) * k };
+}
+// Antennae trail the head's vertical acceleration 4 frames late (overlap + follow-through).
+const ANT = accelSpring((f) => { const b = body(wrap(f)); return b.lift + 0.6 * b.sy; }, { hz: 2.4, zeta: 0.22, gain: 0.012, lag: 4 });
+
+// Sparks: seeded voxels thrown on landing.
+const SPARKS = (() => { const r = mulberry32(42); return Array.from({ length: 10 }, (_, i) => {
+  const a = (i / 10) * Math.PI * 2 + (r() - 0.5) * 0.5;
+  return { a, vh: 1.6 + 1.4 * r(), vy: 2.8 + 1.8 * r(), size: 0.06 + 0.04 * r(), life: 0.4 + 0.3 * r(), axis: new THREE.Vector3(r() - 0.5, r() - 0.5, r() - 0.5).normalize(), spin: 8 + 8 * r(), pitch: r() };
+}); })();
+const sparkMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), M.spark, SPARKS.length);
+sparkMesh.frustumCulled = false; sparkMesh.setColorAt(0, new THREE.Color()); scene.add(sparkMesh);
+
+// Lights: a distant non-decaying key (consistent on the hero wherever it moves), a cool rim, fill, bounce.
+const KEY_DIR = new THREE.Vector3(Math.cos(rad(28)) * Math.sin(rad(40)), Math.sin(rad(28)), Math.cos(rad(28)) * Math.cos(rad(40)));
+const keyLight = new THREE.SpotLight(TEMP.key, 0, 0, rad(10), 0.6, 0);
+keyLight.position.copy(KEY_DIR).multiplyScalar(30); keyLight.target.position.set(0, 0.3, 0);
+keyLight.castShadow = true; keyLight.shadow.mapSize.set(2048, 2048);
+keyLight.shadow.camera.near = 20; keyLight.shadow.camera.far = 40; keyLight.shadow.radius = 6; keyLight.shadow.bias = -0.0002; keyLight.shadow.normalBias = 0.01;
+const RIM_DIR = new THREE.Vector3(Math.cos(rad(14)) * Math.sin(rad(235)), Math.sin(rad(14)), Math.cos(rad(14)) * Math.cos(rad(235)));
+const rimLight = new THREE.SpotLight(TEMP.rim, 0, 0, rad(12), 1, 0);
+rimLight.position.copy(RIM_DIR).multiplyScalar(30); rimLight.target.position.set(0, 0.3, 0);
+const hemi = new THREE.HemisphereLight(0xffffff, 0xcfcac2, LEVELS.fill), bounce = new THREE.AmbientLight(0xffffff, 0);
+scene.add(keyLight, keyLight.target, rimLight, rimLight.target, hemi, bounce);
+
+// Camera: slow orbit, a little push-in through the hop.
+function cameraAt(f) {
+  const az = rad(8) * Math.sin((2 * Math.PI * f) / N), el = rad(24);
+  const dist = 13 * (1 - 0.12 * sstep(50, 100, f) * (1 - sstep(150, 220, f)));
+  const look = new THREE.Vector3(0, 0.55, 0);
+  return { pos: new THREE.Vector3(dist * Math.cos(el) * Math.sin(az), look.y + dist * Math.sin(el), dist * Math.cos(el) * Math.cos(az)), look };
+}
+
+// Overlay: one checklist row, top-left, that ticks on the landing.
+const LABEL = { x: 56, y: 76, font: '500 28px "Geist Mono"', text: '01 SQUASH & STRETCH' };
+function drawOverlay(f) {
+  const on = f >= T.land && f < T.off, d = f - T.land, pop = on ? 1 + 0.5 * Math.exp(-d / 3) * Math.cos(d * 0.5) : 1;
+  setOverlay(on ? (d < 14 ? 'pop' + Math.round(d * 4) : 'on') : 'off', (g) => {
+    g.font = LABEL.font; g.textBaseline = 'alphabetic';
+    const cx = LABEL.x + 9, cy = LABEL.y - 10, r = 9 * pop;
+    g.beginPath(); g.moveTo(cx, cy - r); g.lineTo(cx + r, cy); g.lineTo(cx, cy + r); g.lineTo(cx - r, cy); g.closePath(); g.lineWidth = 2;
+    if (on) { g.fillStyle = CSS.accent; g.fill(); g.strokeStyle = CSS.ink; } else g.strokeStyle = CSS.gray;
+    g.stroke();
+    g.fillStyle = on ? CSS.ink : CSS.gray; g.fillText(LABEL.text, LABEL.x + 34, LABEL.y);
+  });
+}
+CHECK.keepOut.push((() => { octx.font = LABEL.font; return { name: 'label', x0: LABEL.x - 4, y0: LABEL.y - 30, x1: LABEL.x + 34 + octx.measureText(LABEL.text).width, y1: LABEL.y + 10 }; })());
+CHECK.props.plinth = plinth;
+CHECK.probes.heroFront = (f) => new THREE.Vector3(0, GROUND + body(f).lift + 0.35, 0.31);   // lit front face
+CHECK.probes.plinthTop = () => new THREE.Vector3(-1.2, 0.0, 1.4);
+CHECK.notes.heroFrontTarget = '#D97757';
+
+const WHITE = new THREE.Color(1, 1, 1), _o = new THREE.Object3D(), _c = new THREE.Color(), _q = new THREE.Quaternion();
+function update(f) {
+  const lk = lightLevel(T.keyOn, f, T.off), lr = lightLevel(T.keyOn + 18, f, T.off);
+  keyLight.intensity = LEVELS.key * lk; rimLight.intensity = LEVELS.rim * lr;
+  bounce.color.setRGB(0, 0, 0).add(_c.copy(TEMP.key).lerp(WHITE, 0.5).multiplyScalar(LEVELS.bounceKey * lk)).add(_c.copy(TEMP.rim).multiplyScalar(LEVELS.bounceRim * lr));
+  backdrop.material.uniforms.uColor.value.copy(BACKDROP_LIN).multiplyScalar(LEVELS.backOff)
+    .add(_c.copy(TEMP.key).lerp(WHITE, 0.55).multiply(BACKDROP_LIN).multiplyScalar(LEVELS.backKey * lk))
+    .add(_c.copy(TEMP.rim).lerp(WHITE, 0.4).multiply(BACKDROP_LIN).multiplyScalar(LEVELS.backRim * lr));
+
+  const b = body(f);
+  hero.rig.position.set(0, GROUND + b.lift + HALF, 0);
+  hero.def.scale.set(b.sx, b.sy, b.sx);
+  const gx = keys([[0, 0], [T.keyOn + 1, 0], [T.keyOn + 5, 0.8], [40, 0.8], [46, 0], [T.crouch, 0], [T.crouch + 4, 0.3]], f);
+  hero.rig.rotation.set(0, gx * 0.18, 0);
+  hero.eyes.forEach((e, i) => { e.position.x = (i ? 0.12 : -0.12) + gx * 0.06; });
+  const ant = clamp(tab(ANT, f), -0.9, 0.9);
+  hero.antennae.forEach((a, i) => a.rotation.set(0, 0, (i ? -1 : 1) * 0.12 - ant * (i ? -1 : 1)));
+
+  let si = 0;
+  for (const p of SPARKS) {
+    let tau = (f - T.land) / FPS; if (FILM.LOOP && tau < 0) tau += DUR;
+    if (tau < 0 || tau > p.life) { _o.position.set(0, -50, 0); _o.scale.setScalar(0); }
+    else {
+      const x = Math.cos(p.a) * (0.45 + p.vh * tau), z = Math.sin(p.a) * (0.45 + p.vh * tau) * 0.7;
+      const y = Math.max(0.03, 0.08 + p.vy * tau - 0.5 * 15 * tau * tau);
+      _o.position.set(x, y, z); _q.setFromAxisAngle(p.axis, p.spin * tau); _o.quaternion.copy(_q);
+      _o.scale.setScalar(p.size * (1 - sstep(0.55 * p.life, p.life, tau)));
+    }
+    _o.updateMatrix(); sparkMesh.setMatrixAt(si, _o.matrix);
+    const e = tau < 0 || tau > p.life ? 0 : 2.8 * Math.pow(1 - tau / p.life, 0.6) + 0.4;
+    sparkMesh.setColorAt(si++, _c.setRGB(e, e, e));
+  }
+  sparkMesh.instanceMatrix.needsUpdate = true; sparkMesh.instanceColor.needsUpdate = true;
+
+  const cam = cameraAt(f);
+  camera.position.copy(cam.pos); camera.lookAt(cam.look); camera.updateMatrixWorld();
+  dofMat.uniforms.cocK.value = 420;              // DOF strength: ~|1/focus - 1/z| scale, in pixels
+  drawOverlay(f);
+}
+function focusPoint() { return hero.rig.getWorldPosition(new THREE.Vector3()); }
+
+// =================================================================== SCORE (scene) ===
+// Every hit lands one frame after its visual event (AT). cue() records it for the sync check.
+const AUDIO = { bpm: 120, lufs: -14, ceilingDbtp: -1.4, groups: ['pad', 'kick', 'bass', 'clicks', 'hop', 'tings', 'pings'] };
+function scoreLoop(S) {
+  const { at, cue, on, I } = S;
+  if (on('pad')) { I.pad(57, T.keyOn, T.off, 0.3, 0.09); I.pad(64, T.keyOn, T.off, 0.35, 0.07); I.pad(72, T.keyOn + 18, T.off, -0.4, 0.045); }
+  if (on('kick')) for (let f = 30; f < T.off - 20; f += 30) { I.kick(f, f % 120 === 30 ? 0.8 : 0.68); cue(f, 'kick'); }
+  if (on('bass')) for (let f = 30; f < T.off - 20; f += 30) I.bass(f, f < 120 ? 41 : 38, 22, 0.34);
+  if (on('clicks')) { I.click(T.keyOn, 0.4); cue(T.keyOn, 'light on'); I.click(T.off, 0, true); cue(T.off, 'lights off'); }
+  if (on('hop')) {
+    I.creak(T.crouch, T.takeoff, 0); I.riser(T.crouch, T.takeoff, 0); cue(T.crouch, 'crouch');
+    I.swish(T.takeoff, 0); cue(T.takeoff, 'takeoff');
+    I.squash(T.land, 0, 210, (f) => body(f).sy, 0.42); cue(T.land, 'landing');
+  }
+  if (on('tings')) SPARKS.forEach((p, i) => I.ting(T.land, i * 0.01, [89, 91, 93, 96, 98][Math.floor(p.pitch * 5)], Math.cos(p.a) * 0.5, 0.06));
+  if (on('pings')) { I.ping(T.land, 86, -0.45, 0.3); cue(T.land, 'label ping'); }
+}
+
+// =================================================================== audio engine ====
+const SR = 48000;
+const AT = (f) => (f + 1) / FPS;                                    // one frame after the picture
+const NOTE = (m) => 440 * Math.pow(2, (m - 69) / 12);
+function makeNoise(ctx, secs, r) { const b = ctx.createBuffer(2, Math.floor(secs * SR), SR); for (let c = 0; c < 2; c++) { const d = b.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] = r() * 2 - 1; } return b; }
+function makeIR(ctx, secs, r) {
+  const n = Math.floor(secs * SR), b = ctx.createBuffer(2, n, SR);
+  for (let c = 0; c < 2; c++) {
+    const d = b.getChannelData(c); let lp = 0;
+    for (let i = 0; i < n; i++) { const t = i / SR; lp += (r() * 2 - 1 - lp) * (0.42 - 0.3 * t / secs); d[i] = lp * Math.exp(-t * 4.0) * Math.min(1, t / 0.01); }
+    let e = 0; for (let i = 0; i < n; i++) e += d[i] * d[i]; const k = 1 / Math.sqrt(e); for (let i = 0; i < n; i++) d[i] *= k;   // unit-energy room
+  }
+  return b;
+}
+// Instrument library. Times are frames (visual events); every voice lands at AT(frame).
+function instruments(ctx, bus, o, r) {
+  const out = (pan = 0, send = 0.15) => bus.out(pan, send);
+  const noiseSrc = (t, dur) => { const s = ctx.createBufferSource(); s.buffer = bus.noise; s.start(t, r() * (bus.noise.duration - dur - 0.1), dur + 0.05); return s; };
+  const env = (g, t, peak, attack, tau, hold = 0) => { g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(peak, t + attack); g.gain.setTargetAtTime(0, t + attack + hold, tau); };
+  const osc = (type, f, t, stop, dest) => { const n = ctx.createOscillator(); n.type = type; n.frequency.value = f; n.connect(dest); n.start(t); n.stop(stop); return n; };
+  const filt = (type, f, q, dest) => { const n = ctx.createBiquadFilter(); n.type = type; n.frequency.value = f; n.Q.value = q; n.connect(dest); return n; };
+  const gain = (v, dest) => { const g = ctx.createGain(); g.gain.value = v; g.connect(dest); return g; };
+  const t_ = (f) => o + AT(f);
+  return {
+    // sustained pad voice that follows a light's flicker and snaps off with it
+    pad(midi, onF, offF, pan, level) {
+      const t0 = t_(onF) - 0.003, t1 = t_(Math.min(offF, N)), f0 = NOTE(midi), e = gain(0, out(pan, 0.4));
+      const lp = filt('lowpass', Math.min(5200, f0 * 4.2), 0.5, e);
+      [[-9, 'sawtooth', 0.45], [8, 'sawtooth', 0.45], [0, 'triangle', 0.9]].forEach(([det, type, a]) => { osc(type, f0, t0, t1 + 0.6, gain(a, lp)).detune.value = det; });
+      osc('sine', 0.25, t0, t1 + 0.6, gain(f0 * 0.9, lp.frequency));
+      e.gain.setValueAtTime(0, t0);
+      FLICKER.forEach((v, i) => e.gain.setTargetAtTime(level * v, t_(onF + i) - 0.002, 0.0025));
+      e.gain.setTargetAtTime(level, t_(onF + FLICKER.length) - 0.002, 0.004); e.gain.setTargetAtTime(0, t1, 0.025);
+    },
+    kick(f, v) {
+      const t = t_(f), d = out(0, 0.03), g = gain(0, d), n = osc('sine', 150, t, t + 0.7, g);
+      n.frequency.setValueAtTime(155, t); n.frequency.exponentialRampToValueAtTime(47, t + 0.11); env(g, t, v, 0.003, 0.11, 0.03);
+      const c = gain(0, d); env(c, t, 0.18 * v, 0.001, 0.004); noiseSrc(t, 0.03).connect(filt('highpass', 2600, 0.7, c));
+    },
+    bass(f, midi, frames, v) {
+      const t = t_(f), t1 = t + frames / FPS, g = gain(0, out(0, 0.02)), lp = filt('lowpass', 900, 1.6, g);
+      lp.frequency.setValueAtTime(1100, t); lp.frequency.setTargetAtTime(240, t, 0.09);
+      osc('sawtooth', NOTE(midi), t, t1 + 0.4, gain(0.55, lp)); osc('sine', NOTE(midi), t, t1 + 0.4, gain(0.9, g));
+      g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(v, t + 0.006); g.gain.setTargetAtTime(v * 0.62, t + 0.01, 0.16); g.gain.setTargetAtTime(0, t1, 0.045);
+    },
+    shaker(f, v, pan) { const t = t_(f), g = gain(0, out(pan, 0.12)); env(g, t, v, 0.007, 0.032, 0.004); noiseSrc(t, 0.14).connect(filt('bandpass', 7200, 1.1, filt('highpass', 4300, 0.7, g))); },
+    // light switch; off = heavier clunk
+    click(f, pan, off = false) {
+      const t = t_(f), d = out(pan, 0.3);
+      for (const dt of [0, 0.009]) { const g = gain(0, d); env(g, t + dt, off ? 0.7 : 0.5, 0.0008, 0.005); noiseSrc(t + dt, 0.04).connect(filt('bandpass', off ? 1700 : 2900, 3.5, g)); }
+      const g = gain(0, d); env(g, t, off ? 0.45 : 0.28, 0.002, off ? 0.05 : 0.025);
+      osc('sine', off ? 150 : 230, t, t + 0.3, g).frequency.exponentialRampToValueAtTime(off ? 70 : 140, t + 0.06);
+    },
+    // stick-slip creak over a crouch (fromF..toF)
+    creak(fromF, toF, pan, level = 1.8) {
+      const t = t_(fromF), dur = (toF - fromF) / FPS, n = Math.ceil((dur + 0.04) * SR), b = ctx.createBuffer(1, n, SR), data = b.getChannelData(0), rr = mulberry32(fromF * 7 + 3);
+      let ph = 0; for (let i = 0; i < n; i++) { const u = i / n; ph += (30 + 46 * u + 9 * Math.sin(u * 23)) / SR; if (ph >= 1) { ph -= 1; data[i] = (0.55 + 0.45 * rr()) * (rr() < 0.5 ? 1 : -1); } }
+      const src = ctx.createBufferSource(); src.buffer = b; const g = gain(0, out(pan, 0.2));
+      g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(level * 0.55, t + 0.006); g.gain.linearRampToValueAtTime(level, t + dur * 0.5); g.gain.setTargetAtTime(0, t + dur, 0.02);
+      src.connect(filt('bandpass', 640, 13, g)); src.connect(filt('bandpass', 1220, 10, g)); src.start(t);
+    },
+    // inhale riser: band-passed noise sweeping up into a takeoff
+    riser(fromF, toF, pan, level = 0.3) {
+      const t = t_(fromF), dur = (toF - fromF) / FPS, g = gain(0, out(pan, 0.2)), bp = filt('bandpass', 380, 1.3, g);
+      bp.frequency.setValueAtTime(360, t); bp.frequency.exponentialRampToValueAtTime(2400, t + dur);
+      g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(level, t + dur); g.gain.setTargetAtTime(0, t + dur, 0.012); noiseSrc(t, dur + 0.08).connect(bp);
+    },
+    swish(f, pan, level = 0.5, top = 5200) {
+      const t = t_(f), d = out(pan, 0.2), g = gain(0, d), bp = filt('bandpass', 700, 1.7, g);
+      bp.frequency.setValueAtTime(650, t); bp.frequency.exponentialRampToValueAtTime(top, t + 0.17); env(g, t, level, 0.025, 0.06, 0.04); noiseSrc(t, 0.4).connect(bp);
+      const cg = gain(0, d); env(cg, t, 0.07, 0.01, 0.05, 0.04); osc('sine', 300, t, t + 0.4, cg).frequency.exponentialRampToValueAtTime(880, t + 0.14);
+    },
+    // rubber squash whose pitch follows the visual squash curve, plus a thump and a squish
+    squash(f, pan, base, syOf, level = 0.3, dur = 0.42) {
+      const t = t_(f), d = out(pan, 0.22), curve = new Float32Array(128);
+      for (let i = 0; i < 128; i++) curve[i] = base * Math.pow(syOf(f + (i / 127) * dur * FPS), 1.7);
+      const sg = gain(0, d), lp = filt('lowpass', 1700, 0.9, sg);
+      osc('triangle', base, t, t + dur + 0.1, lp).frequency.setValueCurveAtTime(curve, t, dur);
+      osc('sine', base * 2, t, t + dur + 0.1, gain(0.35, lp)).frequency.setValueCurveAtTime(curve.map((v) => v * 2), t, dur);
+      env(sg, t, level, 0.004, dur / 3.2, 0.02);
+      const tg = gain(0, d); env(tg, t, level * 1.25, 0.002, 0.07); osc('sine', 95, t, t + 0.8, tg).frequency.exponentialRampToValueAtTime(42, t + 0.12);
+      const ng = gain(0, d); env(ng, t, level * 0.45, 0.002, 0.03); noiseSrc(t, 0.12).connect(filt('lowpass', 900, 0.8, ng));
+    },
+    // FM bell ting (spark, sparkle)
+    ting(f, delay, midi, pan, level = 0.06) {
+      const tt = t_(f) + delay, f0 = NOTE(midi), ag = gain(0, out(clamp(pan, -0.9, 0.9), 0.45)); env(ag, tt, level, 0.0015, 0.07 + 0.08 * r());
+      const car = osc('sine', f0, tt, tt + 0.8, ag), mg = gain(f0 * 1.4, car.frequency); mg.gain.setValueAtTime(f0 * 1.4, tt); mg.gain.setTargetAtTime(0, tt, 0.04); osc('sine', f0 * 3.53, tt, tt + 0.8, mg);
+    },
+    ping(f, midi, pan, level = 0.3) {
+      const t = t_(f), g = gain(0, out(pan, 0.45)), f0 = NOTE(midi); env(g, t, level, 0.002, 0.24);
+      osc('sine', f0, t, t + 1.6, g); osc('sine', f0 * 2, t, t + 1.6, gain(0.16, g)); osc('sine', f0 * 3, t, t + 1.6, gain(0.04, g));
+    },
+    tick(f, freq, pan, level = 0.45) {
+      const t = t_(f), d = out(pan, 0.25), g = gain(0, d); env(g, t, level, 0.0005, 0.003); noiseSrc(t, 0.02).connect(filt('bandpass', freq, 6, g));
+      const bg = gain(0, d); env(bg, t, level * 0.11, 0.0008, 0.006); osc('sine', freq * 0.75, t, t + 0.05, bg);
+    },
+    // whoosh over fromF..toF; ampAt(u), panAt(u), freqAt(u) shape it (u = 0..1)
+    whoosh(fromF, toF, { ampAt = (u) => 0.6 * Math.sin(Math.PI * u) ** 1.2, panAt = () => 0, freqAt = (u) => 420 + 2100 * Math.sin(Math.PI * u) ** 1.4 } = {}) {
+      const t0 = t_(fromF), dur = (toF - fromF) / FPS, K = 256, a = new Float32Array(K), p = new Float32Array(K), fc = new Float32Array(K), fc2 = new Float32Array(K);
+      for (let i = 0; i < K; i++) { const u = i / (K - 1); a[i] = ampAt(u); p[i] = clamp(panAt(u), -1, 1); fc[i] = freqAt(u); fc2[i] = fc[i] * 2.1; }
+      const pn = ctx.createStereoPanner(); pn.connect(bus.master); pn.connect(gain(0.25, bus.verbIn));
+      const g = ctx.createGain(); g.connect(pn); g.gain.setValueAtTime(0, t0); g.gain.setValueCurveAtTime(a, t0, dur);
+      pn.pan.setValueAtTime(p[0], t0); pn.pan.setValueCurveAtTime(p, t0, dur);
+      const b1 = filt('bandpass', 500, 1.3, g); b1.frequency.setValueCurveAtTime(fc, t0, dur);
+      const b2 = filt('bandpass', 1000, 3.2, gain(0.35, g)); b2.frequency.setValueCurveAtTime(fc2, t0, dur);
+      const n = noiseSrc(t0, dur + 0.1); n.connect(b1); n.connect(b2);
+    },
+    blip(f, pan, level = 0.22) { const t = t_(f), g = gain(0, out(pan, 0.3)); env(g, t, level, 0.002, 0.025); osc('sine', 1250, t, t + 0.2, g).frequency.exponentialRampToValueAtTime(1950, t + 0.04); },
+  };
+}
+
+// Mastering: BS.1770 loudness, cyclic 4x true-peak limiter (loops stay seamless), 24-bit WAV.
+function kWeightMeanSquare(x, cyclic) {
+  const n = x.length; let buf = x;
+  for (const [b0, b1, b2, a1, a2] of [[1.53512485958697, -2.69169618940638, 1.19839281085285, -1.69065929318241, 0.73248077421585], [1, -2, 1, -1.99004745483398, 0.99007225036621]]) {
+    const o = new Float64Array(n); let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+    for (let pass = 0; pass < (cyclic ? 2 : 1); pass++) for (let i = 0; i < n; i++) { const v = buf[i], y = b0 * v + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2; x2 = x1; x1 = v; y2 = y1; y1 = y; o[i] = y; }
+    buf = o;
+  }
+  return buf.map((v) => v * v);
+}
+function loudness(L, R, cyclic) {
+  const n = L.length, ml = kWeightMeanSquare(L, cyclic), mr = kWeightMeanSquare(R, cyclic), win = Math.round(0.4 * SR), hop = Math.round(0.1 * SR), blocks = [];
+  const cl = new Float64Array(n + 1), cr = new Float64Array(n + 1);
+  for (let i = 0; i < n; i++) { cl[i + 1] = cl[i] + ml[i]; cr[i + 1] = cr[i] + mr[i]; }
+  const sum = (c, a, b) => (b <= n ? c[b] - c[a] : c[n] - c[a] + c[b - n]);
+  for (let s = 0; s + (cyclic ? 0 : win) <= n - (cyclic ? 1 : 0); s += hop) blocks.push((sum(cl, s, s + win) + sum(cr, s, s + win)) / win);
+  const lk = (z) => -0.691 + 10 * Math.log10(z);
+  let g = blocks.filter((z) => lk(z) > -70); const rel = lk(g.reduce((a, b) => a + b, 0) / g.length) - 10; g = g.filter((z) => lk(z) > rel);
+  return lk(g.reduce((a, b) => a + b, 0) / g.length);
+}
+const OS_TAPS = 16, OS_H = [1, 2, 3].map((p) => { const h = []; for (let k = -OS_TAPS; k <= OS_TAPS; k++) { const t = k + p / 4, w = 0.5 + 0.5 * Math.cos(Math.PI * t / (OS_TAPS + 1)); h.push((t === 0 ? 1 : Math.sin(Math.PI * t) / (Math.PI * t)) * w); } return h; });
+function peakEnvelope(chs, cyclic) {
+  const n = chs[0].length, e = new Float32Array(n), at = (x, i) => (cyclic ? x[(i + n) % n] : (i < 0 || i >= n ? 0 : x[i]));
+  for (const x of chs) for (let i = 0; i < n; i++) {
+    let m = Math.abs(x[i]);
+    for (const h of OS_H) { let v = 0; for (let k = -OS_TAPS; k <= OS_TAPS; k++) v += at(x, i + k) * h[k + OS_TAPS]; m = Math.max(m, Math.abs(v)); }
+    e[i] = Math.max(e[i], m);
+  }
+  return e;
+}
+function limit(chs, ceiling, cyclic) {
+  const n = chs[0].length, e = peakEnvelope(chs, cyclic), A = 72, req = new Float32Array(n), g1 = new Float32Array(n), g2 = new Float32Array(n), g3 = new Float32Array(n);
+  const idx = (i) => (cyclic ? (i + n) % n : clamp(i, 0, n - 1));
+  for (let i = 0; i < n; i++) req[i] = Math.min(1, ceiling / Math.max(e[i], 1e-9));
+  for (let i = 0; i < n; i++) { let m = 1; for (let k = -1; k <= A; k++) m = Math.min(m, req[idx(i + k)]); g1[i] = m; }
+  let acc = 0; for (let k = 0; k < A; k++) acc += g1[idx(-k)];
+  for (let i = 0; i < n; i++) { acc += g1[i] - g1[idx(i - A)]; g2[i] = acc / A; }
+  const rel = 1 - Math.exp(-1 / (0.07 * SR)); let g = 1, minG = 1;
+  for (let pass = 0; pass < (cyclic ? 2 : 1); pass++) for (let i = 0; i < n; i++) { g = Math.min(g2[i], g + (1 - g) * rel); g3[i] = Math.min(g, req[i]); if (pass === (cyclic ? 1 : 0)) minG = Math.min(minG, g3[i]); }
+  for (const x of chs) for (let i = 0; i < n; i++) x[i] *= g3[i];
+  return 20 * Math.log10(minG);
+}
+function wav24(chs) {
+  const n = chs[0].length, nc = chs.length, bytes = 44 + n * nc * 3, buf = new ArrayBuffer(bytes), v = new DataView(buf);
+  const str = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  str(0, 'RIFF'); v.setUint32(4, bytes - 8, true); str(8, 'WAVE'); str(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, nc, true);
+  v.setUint32(24, SR, true); v.setUint32(28, SR * nc * 3, true); v.setUint16(32, nc * 3, true); v.setUint16(34, 24, true); str(36, 'data'); v.setUint32(40, n * nc * 3, true);
+  let o = 44;
+  for (let i = 0; i < n; i++) for (let c = 0; c < nc; c++) { const s = Math.max(-8388608, Math.min(8388607, Math.round(chs[c][i] * 8388607))); v.setUint8(o, s & 255); v.setUint8(o + 1, (s >> 8) & 255); v.setUint8(o + 2, (s >> 16) & 255); o += 3; }
+  return new Uint8Array(buf);
+}
+const b64 = (bytes) => { let bin = ''; for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000)); return btoa(bin); };
+
+// Loops render three identical passes and keep the middle, so every tail wraps into the next pass.
+// One-shots render once with a short tail that fades out.
+window.renderAudio = async (opts = {}) => {
+  const n = Math.round(SR * DUR), passes = FILM.LOOP ? 3 : 1, len = FILM.LOOP ? n * 3 : n;
+  const ctx = new OfflineAudioContext({ numberOfChannels: 2, length: len, sampleRate: SR });
+  const master = ctx.createGain(); master.gain.value = 0.5; master.connect(ctx.destination);
+  const verb = ctx.createConvolver(); verb.normalize = false; verb.buffer = makeIR(ctx, 1.8, mulberry32(91));
+  const verbIn = ctx.createGain(), hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 280; verbIn.connect(hp); hp.connect(verb);
+  const verbOut = ctx.createGain(); verbOut.gain.value = 0.3; verb.connect(verbOut); verbOut.connect(master);
+  const bus = { master, verbIn, noise: makeNoise(ctx, 3, mulberry32(77)) };
+  bus.out = (pan = 0, send = 0.15) => { const g = ctx.createGain(), p = ctx.createStereoPanner(); p.pan.value = clamp(pan, -1, 1); g.connect(p); p.connect(master); if (send > 0) { const s = ctx.createGain(); s.gain.value = send; p.connect(s); s.connect(verbIn); } return g; };
+  const events = [];
+  for (let k = 0; k < passes; k++) {
+    const o = k * DUR, r = mulberry32(0x5C0E);                        // identical choices every pass
+    scoreLoop({ at: (f) => o + AT(f), cue: (f, label) => { if (k === (FILM.LOOP ? 1 : 0)) events.push({ frame: f, t: +AT(f).toFixed(5), label }); },
+      on: (g) => !opts.solo || opts.solo.includes(g), I: instruments(ctx, bus, o, r) });
+  }
+  const rendered = await ctx.startRendering();
+  const off = FILM.LOOP ? n : 0, chs = [0, 1].map((c) => rendered.getChannelData(c).slice(off, off + n));
+  if (!FILM.LOOP) { const fade = Math.round(0.05 * SR); for (const x of chs) for (let i = 0; i < fade; i++) x[n - 1 - i] *= i / fade; }
+  const tp = (c) => { const e = peakEnvelope(c, FILM.LOOP); let m = 0; for (const v of e) m = Math.max(m, v); return 20 * Math.log10(m + 1e-12); };
+  const raw = { lufs: loudness(chs[0], chs[1], FILM.LOOP), tp: tp(chs) };
+  if (opts.solo || opts.raw) return { stats: { rawLufs: +raw.lufs.toFixed(2), rawTruePeakDb: +raw.tp.toFixed(2) }, wav: opts.raw ? b64(wav24(chs)) : null, events };
+  let gainDb = AUDIO.lufs - raw.lufs, out, lu, gr;
+  for (let it = 0; it < 8; it++) {
+    const gl = 10 ** (gainDb / 20); out = chs.map((x) => Float32Array.from(x, (v) => v * gl));
+    gr = limit(out, 10 ** (AUDIO.ceilingDbtp / 20), FILM.LOOP); lu = loudness(out[0], out[1], FILM.LOOP);
+    if (Math.abs(lu - AUDIO.lufs) <= 0.05) break;
+    gainDb += AUDIO.lufs - lu;
+  }
+  const stats = { rawLufs: +raw.lufs.toFixed(2), rawTruePeakDb: +raw.tp.toFixed(2), gainDb: +gainDb.toFixed(2), maxGainReductionDb: +gr.toFixed(2), lufs: +lu.toFixed(2), truePeakDbtp: +tp(out).toFixed(2) };
+  if (opts.asBuffer) { const b = new AudioBuffer({ numberOfChannels: 2, length: n, sampleRate: SR }); b.copyToChannel(out[0], 0); b.copyToChannel(out[1], 1); return { buffer: b, stats, events }; }
+  return { wav: b64(wav24(out)), stats, events, groups: AUDIO.groups };
+};
+window.AUDIO_GROUPS = AUDIO.groups;
+
+// =================================================================== frame ==========
+function renderFrame(f) {
+  scene.updateMatrixWorld();
+  _v.copy(focusPoint()).applyMatrix4(camera.matrixWorldInverse); dofMat.uniforms.focus.value = Math.max(0.5, -_v.z);
+  renderer.setRenderTarget(rtDepth); scene.overrideMaterial = depthOnly; renderer.shadowMap.needsUpdate = false; renderer.render(scene, camera); scene.overrideMaterial = null;
+  renderer.setRenderTarget(rtScene); renderer.setClearColor(0x808080, 1); renderer.shadowMap.needsUpdate = true; renderer.render(scene, camera);
+  dofMat.uniforms.tColor.value = rtScene.texture; dofMat.uniforms.tDepth.value = rtDepth.depthTexture; pass(dofMat, rtDof);
+  prefilterMat.uniforms.tSrc.value = rtDof.texture; prefilterMat.uniforms.texel.value.set(1 / W, 1 / H); pass(prefilterMat, rtDown[0]);
+  for (let i = 1; i < BLOOM_LEVELS; i++) { downMat.uniforms.tSrc.value = rtDown[i - 1].texture; downMat.uniforms.texel.value.set(1 / rtDown[i - 1].width, 1 / rtDown[i - 1].height); pass(downMat, rtDown[i]); }
+  let src = rtDown[BLOOM_LEVELS - 1];
+  for (let i = BLOOM_LEVELS - 2; i >= 0; i--) { upMat.uniforms.tSrc.value = src.texture; upMat.uniforms.tAdd.value = rtDown[i].texture; upMat.uniforms.texel.value.set(1 / src.width, 1 / src.height); pass(upMat, rtUp[i]); src = rtUp[i]; }
+  finalMat.uniforms.tBloom.value = src.texture; finalMat.uniforms.frame.value = Math.floor(wrap(f) + 1e-6);
+  pass(finalMat, null);
+}
+const frameOf = (t) => wrap(Math.round(t * FPS * 1e4) / 1e4);
+window.renderAt = (t) => { const f = frameOf(t); update(f); renderFrame(f); return f; };
+window.seek = window.renderAt;
+window.frameCheck = (t) => {
+  const f = frameOf(t); update(f); scene.updateMatrixWorld();
+  return {
+    f, keepOut: CHECK.keepOut, notes: CHECK.notes,
+    props: Object.fromEntries(Object.entries(CHECK.props).map(([k, o]) => [k, rectOf(o)])),
+    probes: Object.fromEntries(Object.entries(CHECK.probes).map(([k, fn]) => [k, project(fn(f))])),
+  };
+};
+
+// =================================================================== boot ===========
+await document.fonts.load('500 28px "Geist Mono"');
+renderer.compile(scene, camera);
+window.renderAt(0);
+window.filmReady = true;
+if (!RENDER) {
+  let t0 = performance.now(), audio = null;
+  const tick = () => { const t = (performance.now() - t0) / 1000; window.renderAt(FILM.LOOP ? t % DUR : Math.min(t, DUR - 1 / FPS)); requestAnimationFrame(tick); };
+  requestAnimationFrame(tick);
+  canvas.addEventListener('click', async () => {                     // click: play with sound (restarts the picture in sync)
+    if (audio) { audio.close(); audio = null; return; }
+    const { buffer } = await window.renderAudio({ asBuffer: true });
+    audio = new AudioContext({ sampleRate: buffer.sampleRate });
+    const s = audio.createBufferSource(); s.buffer = buffer; s.loop = FILM.LOOP; s.connect(audio.destination); s.start(); t0 = performance.now();
+  });
+}
+</script>
+</body>
+</html>

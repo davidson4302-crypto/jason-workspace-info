@@ -1,0 +1,65 @@
+{
+  "skill_name": "threejs-film",
+  "evals": [
+    {
+      "id": 1,
+      "name": "frog-hop-loop",
+      "prompt": "make me a 4 second seamless loop, square 1080: a little voxel frog sits on a lily pad floating in a tiny round pond on a wooden plinth. its cheeks puff before it does one big hop straight up, then it lands back on the pad with a splash (ripples + a few droplets). soft warm morning light from the left, cool rim from behind. gentle plucky synth score in G major with a boing on the landing. mix to -14 LUFS",
+      "expected_output": "1080x1080 60 fps 4 s seamless-loop MP4 with muxed 48 kHz stereo score at -14 LUFS, single three.js HTML source, beat sheet",
+      "files": [],
+      "assertions": [
+        "An MP4 was delivered",
+        "Resolution matches the brief",
+        "60 fps with the requested duration (+-1 frame)",
+        "Audio is muxed in: 48 kHz stereo",
+        "Integrated loudness is -14 LUFS (+-1)",
+        "True peak is at or below -1.0 dBTP",
+        "A single-file three.js HTML source was delivered",
+        "Randomness is seeded (no Math.random in the source)",
+        "A frame-level plan (beat sheet) was written",
+        "Notes report measurements and judgment calls",
+        "Loop seam: the last frame flows into the first like any other step"
+      ]
+    },
+    {
+      "id": 2,
+      "name": "speaker-hero-oneshot",
+      "prompt": "5s 1920x1080 hero shot for our app launch: a glossy white smart speaker on a slow turntable in a dark studio. it does a half turn while a ring of light around its top pulses 3 times in our brand teal #14B8A6, then the camera pushes in and the ring locks on solid. not a loop. sound: low synth drone that rises the whole time, a soft chime on each pulse, a deeper chime when it locks.",
+      "expected_output": "1920x1080 60 fps 5 s one-shot MP4 with muxed score, teal ring reads #14B8A6, three pulses then lock",
+      "files": [],
+      "assertions": [
+        "An MP4 was delivered",
+        "Resolution matches the brief",
+        "60 fps with the requested duration (+-1 frame)",
+        "Audio is muxed in: 48 kHz stereo",
+        "Integrated loudness is -14 LUFS (+-1)",
+        "True peak is at or below -1.0 dBTP",
+        "A single-file three.js HTML source was delivered",
+        "Randomness is seeded (no Math.random in the source)",
+        "A frame-level plan (beat sheet) was written",
+        "Notes report measurements and judgment calls",
+        "Brand teal #14B8A6 reads on the ring in the final frame"
+      ]
+    },
+    {
+      "id": 3,
+      "name": "blocks-follow-through-vertical",
+      "prompt": "vertical 1080x1920 for reels, 4 seconds, looping. three stacked blocks (red, yellow, blue) sit on a white shelf. the top block gets flicked off, tumbles through the air in an arc and lands on the floor with a squash. the two blocks left on the shelf wobble and settle (overlapping action / follow-through). big label up top in Geist Mono that says FOLLOW-THROUGH, it appears when the wobble starts. bouncy percussion, every hit in sync.",
+      "expected_output": "1080x1920 60 fps 4 s looping MP4 with muxed score, label in a keep-out zone the props never enter, wobble settle visible",
+      "files": [],
+      "assertions": [
+        "An MP4 was delivered",
+        "Resolution matches the brief",
+        "60 fps with the requested duration (+-1 frame)",
+        "Audio is muxed in: 48 kHz stereo",
+        "Integrated loudness is -14 LUFS (+-1)",
+        "True peak is at or below -1.0 dBTP",
+        "A single-file three.js HTML source was delivered",
+        "Randomness is seeded (no Math.random in the source)",
+        "A frame-level plan (beat sheet) was written",
+        "Notes report measurements and judgment calls",
+        "Loop seam: the last frame flows into the first like any other step"
+      ]
+    }
+  ]
+}
